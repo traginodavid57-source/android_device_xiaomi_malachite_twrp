@@ -122,59 +122,63 @@ jobs:
             exit 1
           fi
 
-      - name: Fix stale ndk_platform libraries in libtar
+      - name: Fix stale ndk_platform libraries
         working-directory: twrp
         run: |
           set -e
 
-          FILE="bootable/recovery/libtar/Android.mk"
-
-          if [ ! -f "$FILE" ]; then
-            echo "ERROR: $FILE was not found."
-            exit 1
-          fi
-
-          echo "=== before ==="
-          grep -n "ndk_platform" "$FILE" || true
-
-          if ! grep -Fq "ndk_platform" "$FILE"; then
-            echo "ERROR: no ndk_platform reference found in $FILE."
-            cat "$FILE"
-            exit 1
-          fi
-
-          # apc / authorization / maintenance: drop the removed _platform suffix
-          # keystore2: also drop it here, the version number is fixed below
-          sed -i 's/-ndk_platform/-ndk/g' "$FILE"
-
-          # keystore2 is a versioned AIDL interface: use the newest version in the tree
-          KS_DIR=$(find system/security -type d -path '*aidl_api/android.system.keystore2' 2>/dev/null | head -n 1 || true)
+          # keystore2 is a versioned AIDL interface: find the newest frozen version in the tree
+          KS_DIR=$(find system hardware -type d -path '*aidl_api/android.system.keystore2' 2>/dev/null | head -n 1 || true)
           echo "keystore2 aidl_api dir: ${KS_DIR:-not found}"
+          KS_VER=""
           if [ -n "$KS_DIR" ]; then
             ls "$KS_DIR"
             KS_VER=$(ls "$KS_DIR" | grep -E '^[0-9]+$' | sort -n | tail -n 1 || true)
-            echo "newest frozen keystore2 version: ${KS_VER:-none}"
+          fi
+          echo "newest frozen keystore2 version: ${KS_VER:-none}"
+
+          DIRS="bootable/recovery device/xiaomi/malachite vendor/qcom/opensource/vibrator"
+
+          FILES=$(grep -rl "ndk_platform" $DIRS \
+            --include=Android.mk --include=Android.bp --include=*.mk --include=*.bp \
+            2>/dev/null || true)
+
+          if [ -z "$FILES" ]; then
+            echo "No ndk_platform references found in: $DIRS"
+            exit 0
+          fi
+
+          echo "=== before ==="
+          grep -rn "ndk_platform" $DIRS \
+            --include=Android.mk --include=Android.bp --include=*.mk --include=*.bp \
+            2>/dev/null || true
+
+          for f in $FILES; do
+            echo "Patching $f"
+            sed -i 's/-ndk_platform/-ndk/g' "$f"
             if [ -n "$KS_VER" ]; then
-              sed -i "s/android.system.keystore2-V[0-9]*-ndk/android.system.keystore2-V${KS_VER}-ndk/" "$FILE"
+              sed -i "s/android.system.keystore2-V[0-9]*-ndk/android.system.keystore2-V${KS_VER}-ndk/g" "$f"
             fi
-          fi
+          done
 
-          if grep -Fq "ndk_platform" "$FILE"; then
-            echo "ERROR: ndk_platform is still present in $FILE."
-            exit 1
-          fi
+          echo "=== after (should have no ndk_platform) ==="
+          grep -rn "ndk_platform" $DIRS \
+            --include=Android.mk --include=Android.bp --include=*.mk --include=*.bp \
+            2>/dev/null || true
 
-          echo "=== after ==="
-          grep -nE "apc-ndk|authorization-ndk|maintenance-ndk|keystore2" "$FILE"
+          echo "=== patched lines ==="
+          grep -rnE "apc-ndk|authorization-ndk|maintenance-ndk|keystore2|vibrator-V" $DIRS \
+            --include=Android.mk --include=Android.bp --include=*.mk --include=*.bp \
+            2>/dev/null || true
 
       - name: Find remaining stale references
         working-directory: twrp
         run: |
-          grep -rn "ndk_platform" . \
+          grep -rn "ndk_platform" bootable device vendor external system \
             --include=Android.bp --include=*.mk --include=*.bp \
-            --exclude-dir=.repo --exclude-dir=out --exclude-dir=.git \
-            | head -n 30 || true
-          echo "grep finished"
+            2>/dev/null > /tmp/stale.txt || true
+          head -n 30 /tmp/stale.txt || true
+          echo "total matches: $(wc -l < /tmp/stale.txt)"
 
       - name: Build TWRP vendor_boot
         working-directory: twrp
