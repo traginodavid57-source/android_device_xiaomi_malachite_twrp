@@ -143,11 +143,21 @@ jobs:
             exit 1
           fi
 
-          # android.security.apc-ndk_platform          -> android.security.apc-ndk
-          # android.security.authorization-ndk_platform -> android.security.authorization-ndk
-          # android.security.maintenance-ndk_platform   -> android.security.maintenance-ndk
-          # android.system.keystore2-V1-ndk_platform    -> android.system.keystore2-V1-ndk
+          # apc / authorization / maintenance: drop the removed _platform suffix
+          # keystore2: also drop it here, the version number is fixed below
           sed -i 's/-ndk_platform/-ndk/g' "$FILE"
+
+          # keystore2 is a versioned AIDL interface: use the newest version in the tree
+          KS_DIR=$(find system/security -type d -path '*aidl_api/android.system.keystore2' 2>/dev/null | head -n 1 || true)
+          echo "keystore2 aidl_api dir: ${KS_DIR:-not found}"
+          if [ -n "$KS_DIR" ]; then
+            ls "$KS_DIR"
+            KS_VER=$(ls "$KS_DIR" | grep -E '^[0-9]+$' | sort -n | tail -n 1 || true)
+            echo "newest frozen keystore2 version: ${KS_VER:-none}"
+            if [ -n "$KS_VER" ]; then
+              sed -i "s/android.system.keystore2-V[0-9]*-ndk/android.system.keystore2-V${KS_VER}-ndk/" "$FILE"
+            fi
+          fi
 
           if grep -Fq "ndk_platform" "$FILE"; then
             echo "ERROR: ndk_platform is still present in $FILE."
@@ -156,9 +166,6 @@ jobs:
 
           echo "=== after ==="
           grep -nE "apc-ndk|authorization-ndk|maintenance-ndk|keystore2" "$FILE"
-
-          echo "=== keystore2 aidl versions available in the tree ==="
-          ls system/hardware/interfaces/keystore2/aidl_api/android.system.keystore2 2>/dev/null || true
 
       - name: Find remaining stale references
         working-directory: twrp
