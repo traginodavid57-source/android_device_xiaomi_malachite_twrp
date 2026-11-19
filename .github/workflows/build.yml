@@ -122,44 +122,52 @@ jobs:
             exit 1
           fi
 
-      - name: Fix APC library name in libtar
+      - name: Fix stale ndk_platform libraries in libtar
         working-directory: twrp
         run: |
           set -e
 
           FILE="bootable/recovery/libtar/Android.mk"
-          OLD="android.security.apc-ndk_platform"
-          NEW="android.security.apc-ndk"
 
           if [ ! -f "$FILE" ]; then
             echo "ERROR: $FILE was not found."
             exit 1
           fi
 
-          if ! grep -Fq "$OLD" "$FILE"; then
-            echo "ERROR: The old library name was not found in $FILE."
-            echo "Contents of the file:"
+          echo "=== before ==="
+          grep -n "ndk_platform" "$FILE" || true
+
+          if ! grep -Fq "ndk_platform" "$FILE"; then
+            echo "ERROR: no ndk_platform reference found in $FILE."
             cat "$FILE"
             exit 1
           fi
 
-          sed -i "s/${OLD}/${NEW}/g" "$FILE"
+          # android.security.apc-ndk_platform          -> android.security.apc-ndk
+          # android.security.authorization-ndk_platform -> android.security.authorization-ndk
+          # android.security.maintenance-ndk_platform   -> android.security.maintenance-ndk
+          # android.system.keystore2-V1-ndk_platform    -> android.system.keystore2-V1-ndk
+          sed -i 's/-ndk_platform/-ndk/g' "$FILE"
 
-          if grep -Fq "$OLD" "$FILE"; then
-            echo "ERROR: The old library name is still present in $FILE."
+          if grep -Fq "ndk_platform" "$FILE"; then
+            echo "ERROR: ndk_platform is still present in $FILE."
             exit 1
           fi
 
-          echo "Updated library reference in $FILE:"
-          grep -nF "$NEW" "$FILE"
+          echo "=== after ==="
+          grep -nE "apc-ndk|authorization-ndk|maintenance-ndk|keystore2" "$FILE"
+
+          echo "=== keystore2 aidl versions available in the tree ==="
+          ls system/hardware/interfaces/keystore2/aidl_api/android.system.keystore2 2>/dev/null || true
 
       - name: Find remaining stale references
         working-directory: twrp
         run: |
-          grep -rn "android.security.apc-ndk_platform" . \
+          grep -rn "ndk_platform" . \
             --include=Android.bp --include=*.mk --include=*.bp \
             --exclude-dir=.repo --exclude-dir=out --exclude-dir=.git \
             | head -n 30 || true
+          echo "grep finished"
 
       - name: Build TWRP vendor_boot
         working-directory: twrp
