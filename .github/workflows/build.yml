@@ -1,3 +1,4 @@
+
 name: Build TWRP Malachite Android 16
 
 on:
@@ -7,6 +8,10 @@ on:
         description: "ALLOW_MISSING_DEPENDENCIES (true/false)"
         required: false
         default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
 
 permissions:
   contents: read
@@ -18,6 +23,10 @@ jobs:
     timeout-minutes: 360
 
     steps:
+      # ==========================================
+      # FREE DISK SPACE
+      # ==========================================
+
       - name: Free disk space
         run: |
           sudo rm -rf /usr/share/dotnet
@@ -25,8 +34,15 @@ jobs:
           sudo rm -rf /usr/local/lib/android
           sudo rm -rf /usr/share/swift
           sudo rm -rf /usr/local/share/boost
+          sudo rm -rf /opt/ghc
           sudo docker image prune --all --force || true
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
           df -h
+
+      # ==========================================
+      # SWAP
+      # ==========================================
 
       - name: Add swap
         run: |
@@ -36,6 +52,10 @@ jobs:
           sudo mkswap /swapfile
           sudo swapon /swapfile
           free -h
+
+      # ==========================================
+      # DEPENDENCIES
+      # ==========================================
 
       - name: Install dependencies
         run: |
@@ -51,7 +71,13 @@ jobs:
             libxml2-utils xsltproc unzip fontconfig \
             python3 python-is-python3 rsync \
             bc ccache lz4 libssl-dev \
-            libncurses-dev imagemagick
+            libncurses-dev imagemagick \
+            libelf-dev liblz4-tool \
+            libxml2-utils libzstd-dev
+
+      # ==========================================
+      # REPO TOOL
+      # ==========================================
 
       - name: Install repo
         run: |
@@ -62,13 +88,22 @@ jobs:
             -o "$HOME/bin/repo"
 
           chmod +x "$HOME/bin/repo"
+
           echo "$HOME/bin" >> "$GITHUB_PATH"
+
+      # ==========================================
+      # GIT CONFIG
+      # ==========================================
 
       - name: Configure git
         run: |
           git config --global user.name "github-actions"
           git config --global user.email "actions@github.com"
           git config --global color.ui false
+
+      # ==========================================
+      # INITIALIZE TWRP
+      # ==========================================
 
       - name: Initialize TWRP
         run: |
@@ -78,6 +113,10 @@ jobs:
           repo init --depth=1 \
             -u https://github.com/minimal-manifest-twrp/platform_manifest_twrp_aosp.git \
             -b twrp-14.1
+
+      # ==========================================
+      # MALACHITE MANIFEST
+      # ==========================================
 
       - name: Add Malachite manifest
         working-directory: twrp
@@ -99,114 +138,213 @@ jobs:
           </manifest>
           EOF
 
+      # ==========================================
+      # SYNC SOURCES
+      # ==========================================
+
       - name: Sync sources
         working-directory: twrp
         run: |
           repo sync -c --no-tags --optimized-fetch -j2
 
-      - name: Check disk space
+      - name: Check resources after sync
         run: |
+          echo "=== DISK ==="
           df -h
+
+          echo "=== MEMORY ==="
           free -h
+
+          echo "=== SOURCE SIZE ==="
+          du -sh twrp
+
+          AVAILABLE=$(df -BG --output=avail "$GITHUB_WORKSPACE" | tail -n 1 | tr -dc '0-9')
+
+          echo "Available disk: ${AVAILABLE}G"
+
+          if [ "$AVAILABLE" -lt 10 ]; then
+            echo "WARNING: Less than 10 GB available."
+          fi
+
+      # ==========================================
+      # APPLY MALACHITE PATCH
+      # ==========================================
 
       - name: Apply Malachite patch
         working-directory: twrp
         run: |
+          set -e
+
           PATCH="device/xiaomi/malachite/patches/0001-minuitwrp-skip-unavailable-aidl-haptics.patch"
 
-          if git -C bootable/recovery apply --check "../../$PATCH"; then
-            git -C bootable/recovery apply "../../$PATCH"
-            echo "Patch applied successfully."
-          else
-            echo "Patch cannot be applied. Check the base revision."
+          if [ ! -f "$PATCH" ]; then
+            echo "ERROR: Malachite patch not found!"
             exit 1
           fi
 
-      - name: Fix stale ndk_platform libraries
+          if git -C bootable/recovery apply --check "../../$PATCH"; then
+            git -C bootable/recovery apply "../../$PATCH"
+            echo "Malachite patch applied successfully."
+          else
+            echo "ERROR: Patch cannot be applied."
+            exit 1
+          fi
+
+      # ==========================================
+      # FIX AIDL NDK DEPENDENCIES
+      # ==========================================
+
+      - name: Fix TWRP AIDL dependencies
         working-directory: twrp
         run: |
           set -e
 
-          # keystore2 is a versioned AIDL interface: find the newest frozen version in the tree
-          KS_DIR=$(find system hardware -type d -path '*aidl_api/android.system.keystore2' 2>/dev/null | head -n 1 || true)
-          echo "keystore2 aidl_api dir: ${KS_DIR:-not found}"
-          KS_VER=""
-          if [ -n "$KS_DIR" ]; then
-            ls "$KS_DIR"
-            KS_VER=$(ls "$KS_DIR" | grep -E '^[0-9]+$' | sort -n | tail -n 1 || true)
-          fi
-          echo "newest frozen keystore2 version: ${KS_VER:-none}"
+          RECOVERY_MK="bootable/recovery/Android.mk"
 
-          DIRS="bootable/recovery device/xiaomi/malachite vendor/qcom/opensource/vibrator"
-
-          FILES=$(grep -rl "ndk_platform" $DIRS \
-            --include=Android.mk --include=Android.bp --include=*.mk --include=*.bp \
-            2>/dev/null || true)
-
-          if [ -z "$FILES" ]; then
-            echo "No ndk_platform references found in: $DIRS"
-            exit 0
+          if [ ! -f "$RECOVERY_MK" ]; then
+            echo "ERROR: Recovery Android.mk not found!"
+            exit 1
           fi
 
-          echo "=== before ==="
-          grep -rn "ndk_platform" $DIRS \
-            --include=Android.mk --include=Android.bp --include=*.mk --include=*.bp \
-            2>/dev/null || true
+          echo "=== BEFORE FIX ==="
 
-          for f in $FILES; do
-            echo "Patching $f"
-            sed -i 's/-ndk_platform/-ndk/g' "$f"
-            if [ -n "$KS_VER" ]; then
-              sed -i "s/android.system.keystore2-V[0-9]*-ndk/android.system.keystore2-V${KS_VER}-ndk/g" "$f"
-            fi
-          done
+          grep -nE \
+            'android.security.authorization|android.security.maintenance|android.system.keystore2' \
+            "$RECOVERY_MK" || true
 
-          echo "=== after (should have no ndk_platform) ==="
-          grep -rn "ndk_platform" $DIRS \
-            --include=Android.mk --include=Android.bp --include=*.mk --include=*.bp \
-            2>/dev/null || true
+          # Modern AIDL NDK backend compatibility.
+          # Fix the recovery dependencies specifically.
 
-          echo "=== patched lines ==="
-          grep -rnE "apc-ndk|authorization-ndk|maintenance-ndk|keystore2|vibrator-V" $DIRS \
-            --include=Android.mk --include=Android.bp --include=*.mk --include=*.bp \
-            2>/dev/null || true
+          sed -i \
+            's/-ndk_platform/-ndk/g' \
+            "$RECOVERY_MK"
+
+          echo "=== AFTER FIX ==="
+
+          grep -nE \
+            'android.security.authorization|android.security.maintenance|android.system.keystore2' \
+            "$RECOVERY_MK" || true
+
+          # Verify the failing module was corrected.
+
+          if grep -qF \
+            'android.security.authorization-ndk_platform' \
+            "$RECOVERY_MK"; then
+
+            echo "ERROR: Old authorization dependency remains!"
+            exit 1
+          fi
+
+          if ! grep -qF \
+            'android.security.authorization-ndk' \
+            "$RECOVERY_MK"; then
+
+            echo "ERROR: New authorization dependency not found!"
+            exit 1
+          fi
+
+          echo "AIDL dependency correction successful."
+
+      # ==========================================
+      # DIAGNOSE OTHER STALE REFERENCES
+      # ==========================================
 
       - name: Find remaining stale references
         working-directory: twrp
         run: |
-          grep -rn "ndk_platform" bootable device vendor external system \
-            --include=Android.bp --include=*.mk --include=*.bp \
-            2>/dev/null > /tmp/stale.txt || true
-          head -n 30 /tmp/stale.txt || true
-          echo "total matches: $(wc -l < /tmp/stale.txt)"
+          echo "=== REMAINING NDK_PLATFORM REFERENCES ==="
+
+          grep -RIn \
+            --exclude-dir=.git \
+            --exclude-dir=.repo \
+            --exclude-dir=out \
+            --include=Android.mk \
+            --include=Android.bp \
+            --include='*.mk' \
+            --include='*.bp' \
+            'ndk_platform' \
+            bootable device vendor external system hardware frameworks \
+            2>/dev/null | head -n 100 || true
+
+          echo "=== AUTHORIZATION REFERENCES ==="
+
+          grep -RIn \
+            --exclude-dir=.git \
+            --exclude-dir=.repo \
+            --exclude-dir=out \
+            'android.security.authorization-ndk_platform' \
+            bootable device vendor external system hardware frameworks \
+            2>/dev/null || true
+
+      # ==========================================
+      # BUILD TWRP
+      # ==========================================
 
       - name: Build TWRP vendor_boot
         working-directory: twrp
+        env:
+          ALLOW_MISSING_INPUT: ${{ inputs.allow_missing }}
         run: |
-          if [ "${{ github.event.inputs.allow_missing }}" = "true" ]; then
+          set -euo pipefail
+
+          if [ "$ALLOW_MISSING_INPUT" = "true" ]; then
             export ALLOW_MISSING_DEPENDENCIES=true
+          else
+            unset ALLOW_MISSING_DEPENDENCIES || true
           fi
+
           export NINJA_ARGS="-j2"
+
+          echo "=== INITIALIZING BUILD ENVIRONMENT ==="
 
           source build/envsetup.sh
 
+          echo "=== LUNCH ==="
+
           lunch twrp_malachite-ap2a-eng
 
-          mka vendorbootimage -j2
+          echo "=== BUILD CONFIGURATION ==="
 
-      - name: Diagnostics on failure
-        if: failure()
-        run: |
-          echo "=== free ==="
+          echo "Product: $TARGET_PRODUCT"
+          echo "Variant: $TARGET_BUILD_VARIANT"
+          echo "Jobs: 2"
+
+          echo "=== MEMORY ==="
           free -h
-          echo "=== df ==="
-          df -h
-          echo "=== OOM kills ==="
-          sudo dmesg | grep -i -E "out of memory|killed process|oom" | tail -n 20 || true
 
-      - name: Verify image
+          echo "=== DISK ==="
+          df -h
+
+          echo "=== STARTING VENDOR BOOT BUILD ==="
+
+          mkdir -p "$GITHUB_WORKSPACE/build-logs"
+
+          set +e
+
+          mka vendorbootimage -j2 2>&1 | \
+            tee "$GITHUB_WORKSPACE/build-logs/build.log"
+
+          BUILD_STATUS=${PIPESTATUS[0]}
+
+          set -e
+
+          if [ "$BUILD_STATUS" -ne 0 ]; then
+            echo "ERROR: TWRP compilation failed."
+            echo "Build exit code: $BUILD_STATUS"
+            exit "$BUILD_STATUS"
+          fi
+
+          echo "TWRP compilation completed."
+
+      # ==========================================
+      # VERIFY IMAGE
+      # ==========================================
+
+      - name: Verify vendor_boot image
         working-directory: twrp
         run: |
+          set -e
+
           IMAGE="out/target/product/malachite/vendor_boot.img"
 
           if [ ! -s "$IMAGE" ]; then
@@ -214,14 +352,91 @@ jobs:
             exit 1
           fi
 
-          echo "Build successful!"
+          SIZE=$(stat -c%s "$IMAGE")
+          SIZE_MB=$((SIZE / 1024 / 1024))
+
+          echo "=== IMAGE INFORMATION ==="
+
           ls -lh "$IMAGE"
+
+          echo "Size: $SIZE bytes"
+          echo "Size: $SIZE_MB MiB"
+
+          echo "=== SHA256 ==="
+
           sha256sum "$IMAGE"
 
+          echo "=== IMAGE HEADER ==="
+
+          file "$IMAGE"
+
+          # Device vendor_boot partition size:
+          # 67108864 bytes (64 MiB)
+
+          if [ "$SIZE" -gt 67108864 ]; then
+            echo "WARNING: Image exceeds 64 MiB."
+            echo "Do not flash this image!"
+            exit 1
+          fi
+
+          echo "Image is within the configured partition size."
+
+      # ==========================================
+      # UPLOAD TWRP IMAGE
+      # ==========================================
+
       - name: Upload TWRP artifact
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: TWRP-Malachite-Android16
           path: twrp/out/target/product/malachite/vendor_boot.img
           if-no-files-found: error
           retention-days: 14
+
+      # ==========================================
+      # UPLOAD BUILD LOGS
+      # ==========================================
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: TWRP-Malachite-Build-Logs
+          path: |
+            build-logs/
+            twrp/out/soong.log
+            twrp/out/error.log
+          if-no-files-found: warn
+          retention-days: 7
+
+      # ==========================================
+      # FAILURE DIAGNOSTICS
+      # ==========================================
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          echo "=== MEMORY ==="
+          free -h
+
+          echo "=== DISK ==="
+          df -h
+
+          echo "=== OOM KILLS ==="
+          sudo dmesg 2>/dev/null | \
+            grep -iE \
+            "out of memory|killed process|oom" | \
+            tail -n 30 || true
+
+          echo "=== BUILD ERROR SUMMARY ==="
+
+          if [ -f build-logs/build.log ]; then
+            grep -inE \
+              "FAILED:|error:|fatal:|ninja failed|No rule to make target" \
+              build-logs/build.log | \
+              tail -n 60 || true
+          fi
+
+          echo "=== SOURCE DISK USAGE ==="
+          du -sh twrp 2>/dev/null || true
