@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       allow_missing:
-        description: "ALLOW_MISSING_DEPENDENCIES (true/false)"
+        description: "Allow missing dependencies"
         required: false
         default: "true"
         type: choice
@@ -73,7 +73,7 @@ jobs:
             bc ccache lz4 libssl-dev \
             libncurses-dev imagemagick \
             libelf-dev liblz4-tool \
-            libxml2-utils libzstd-dev
+            libzstd-dev
 
       # ==========================================
       # REPO TOOL
@@ -147,6 +147,10 @@ jobs:
         run: |
           repo sync -c --no-tags --optimized-fetch -j2
 
+      # ==========================================
+      # RESOURCE CHECK
+      # ==========================================
+
       - name: Check resources after sync
         run: |
           echo "=== DISK ==="
@@ -186,12 +190,12 @@ jobs:
             git -C bootable/recovery apply "../../$PATCH"
             echo "Malachite patch applied successfully."
           else
-            echo "ERROR: Patch cannot be applied."
+            echo "ERROR: Patch cannot be applied!"
             exit 1
           fi
 
       # ==========================================
-      # FIX AIDL NDK DEPENDENCIES
+      # FIX LIBTAR AIDL DEPENDENCIES
       # ==========================================
 
       - name: Fix TWRP AIDL dependencies
@@ -199,54 +203,33 @@ jobs:
         run: |
           set -e
 
-          RECOVERY_MK="bootable/recovery/Android.mk"
+          FILE="bootable/recovery/libtar/Android.mk"
 
-          if [ ! -f "$RECOVERY_MK" ]; then
-            echo "ERROR: Recovery Android.mk not found!"
+          if [ ! -f "$FILE" ]; then
+            echo "ERROR: libtar Android.mk not found!"
             exit 1
           fi
 
-          echo "=== BEFORE FIX ==="
+          echo "=== BEFORE ==="
+          grep -n 'ndk_platform' "$FILE" || true
 
+          # Migrate libtar dependencies to NDK backend.
+          sed -i 's/-ndk_platform/-ndk/g' "$FILE"
+
+          echo "=== AFTER ==="
           grep -nE \
-            'android.security.authorization|android.security.maintenance|android.system.keystore2' \
-            "$RECOVERY_MK" || true
+            'android.security|android.system.keystore2' \
+            "$FILE" || true
 
-          # Modern AIDL NDK backend compatibility.
-          # Fix the recovery dependencies specifically.
-
-          sed -i \
-            's/-ndk_platform/-ndk/g' \
-            "$RECOVERY_MK"
-
-          echo "=== AFTER FIX ==="
-
-          grep -nE \
-            'android.security.authorization|android.security.maintenance|android.system.keystore2' \
-            "$RECOVERY_MK" || true
-
-          # Verify the failing module was corrected.
-
-          if grep -qF \
-            'android.security.authorization-ndk_platform' \
-            "$RECOVERY_MK"; then
-
-            echo "ERROR: Old authorization dependency remains!"
+          if grep -q 'ndk_platform' "$FILE"; then
+            echo "ERROR: Old dependencies remain in libtar!"
             exit 1
           fi
 
-          if ! grep -qF \
-            'android.security.authorization-ndk' \
-            "$RECOVERY_MK"; then
-
-            echo "ERROR: New authorization dependency not found!"
-            exit 1
-          fi
-
-          echo "AIDL dependency correction successful."
+          echo "libtar dependency migration completed."
 
       # ==========================================
-      # DIAGNOSE OTHER STALE REFERENCES
+      # DIAGNOSE STALE REFERENCES
       # ==========================================
 
       - name: Find remaining stale references
@@ -276,6 +259,15 @@ jobs:
             bootable device vendor external system hardware frameworks \
             2>/dev/null || true
 
+          echo "=== LIBTAR VERIFICATION ==="
+
+          if grep -q 'ndk_platform' bootable/recovery/libtar/Android.mk; then
+            echo "ERROR: libtar still contains old references!"
+            exit 1
+          fi
+
+          echo "libtar verification passed."
+
       # ==========================================
       # BUILD TWRP
       # ==========================================
@@ -285,7 +277,7 @@ jobs:
         env:
           ALLOW_MISSING_INPUT: ${{ inputs.allow_missing }}
         run: |
-          set -euo pipefail
+          set -eo pipefail
 
           if [ "$ALLOW_MISSING_INPUT" = "true" ]; then
             export ALLOW_MISSING_DEPENDENCIES=true
@@ -293,7 +285,7 @@ jobs:
             unset ALLOW_MISSING_DEPENDENCIES || true
           fi
 
-          export NINJA_ARGS="-j2"
+          mkdir -p "$GITHUB_WORKSPACE/build-logs"
 
           echo "=== INITIALIZING BUILD ENVIRONMENT ==="
 
@@ -307,7 +299,6 @@ jobs:
 
           echo "Product: $TARGET_PRODUCT"
           echo "Variant: $TARGET_BUILD_VARIANT"
-          echo "Jobs: 2"
 
           echo "=== MEMORY ==="
           free -h
@@ -316,8 +307,6 @@ jobs:
           df -h
 
           echo "=== STARTING VENDOR BOOT BUILD ==="
-
-          mkdir -p "$GITHUB_WORKSPACE/build-logs"
 
           set +e
 
@@ -370,19 +359,17 @@ jobs:
 
           file "$IMAGE"
 
-          # Device vendor_boot partition size:
-          # 67108864 bytes (64 MiB)
-
+          # Configured vendor_boot partition size: 64 MiB.
           if [ "$SIZE" -gt 67108864 ]; then
-            echo "WARNING: Image exceeds 64 MiB."
+            echo "WARNING: Image exceeds configured partition size."
             echo "Do not flash this image!"
             exit 1
           fi
 
-          echo "Image is within the configured partition size."
+          echo "Image is within configured partition size."
 
       # ==========================================
-      # UPLOAD TWRP IMAGE
+      # UPLOAD IMAGE
       # ==========================================
 
       - name: Upload TWRP artifact
@@ -395,7 +382,7 @@ jobs:
           retention-days: 14
 
       # ==========================================
-      # UPLOAD BUILD LOGS
+      # UPLOAD LOGS
       # ==========================================
 
       - name: Upload build logs
@@ -424,6 +411,7 @@ jobs:
           df -h
 
           echo "=== OOM KILLS ==="
+
           sudo dmesg 2>/dev/null | \
             grep -iE \
             "out of memory|killed process|oom" | \
@@ -433,7 +421,7 @@ jobs:
 
           if [ -f build-logs/build.log ]; then
             grep -inE \
-              "FAILED:|error:|fatal:|ninja failed|No rule to make target" \
+              "FAILED:|error:|fatal:|ninja failed|No rule to make target|missing and no known rule" \
               build-logs/build.log | \
               tail -n 60 || true
           fi
